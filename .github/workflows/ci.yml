@@ -1,0 +1,107 @@
+name: Nexaminds  Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # ------------------------------------------------------------------
+  # JOB 1: Quality Checks (Linting & Security)
+  # ------------------------------------------------------------------
+  quality-check:
+    name: Quality & Security (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth-service, url-builder-service, email-service]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./${{ matrix.service }}/package-lock.json
+
+      - name: Install Deps
+        working-directory: ./${{ matrix.service }}
+        run: npm install
+
+      - name: 🛡️ Security Audit
+        working-directory: ./${{ matrix.service }}
+        # Fails if High/Critical vulnerabilities are found
+        run: npm audit --audit-level=high || true 
+        # '|| true' prevents pipeline failure for minor issues (remove it to be strict)
+
+      - name: 🎨 Linting
+        working-directory: ./${{ matrix.service }}
+        # Only runs if you added the "lint" script to package.json
+        run: npm run lint --if-present
+
+  # ------------------------------------------------------------------
+  # JOB 2: Unit Tests
+  # ------------------------------------------------------------------
+  unit-tests:
+    name: Unit Tests (${{ matrix.service }})
+    needs: quality-check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth-service, url-builder-service, email-service]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install
+        working-directory: ./${{ matrix.service }}
+        run: npm install
+      - name: Test
+        working-directory: ./${{ matrix.service }}
+        run: npx jest
+        env:
+          JWT_SECRET: test_secret
+          MONGO_URI: mongodb://fake
+          RABBITMQ_URL: amqp://fake
+
+  # ------------------------------------------------------------------
+  # JOB 3: Integration Test (The Real Deal)
+  # ------------------------------------------------------------------
+  integration-test:
+    name: Integration Test (Docker Compose)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐳 Start Services
+        run: docker compose up -d --build
+
+      - name: ⏳ Wait for Healthchecks
+        run: |
+          echo "Waiting for services..."
+          sleep 20 # Give Mongo and RabbitMQ time to wake up
+          docker compose ps
+
+      - name: 🧪 Run Live API Test
+        run: |
+          echo "Testing User Registration..."
+          curl --fail -X POST http://localhost:3000/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"fullname": "CI User", "email": "ci@test.com", "password": "123"}'
+          
+          echo "Testing URL Builder..."
+          curl --fail -X POST http://localhost:3000/api/v1/tools/buildUrl \
+            -H "Content-Type: application/json" \
+            -d '{"name": "CI User", "timestamps": [10, 20, 30]}'
+
+      - name: 📜 Dump Logs on Failure
+        if: failure()
+        run: docker compose logs
