@@ -1,0 +1,142 @@
+name: Nexaminds Senior TypeScript Pipeline
+
+on:
+  push:
+    branches: 
+      - "refactor/typescript"
+  pull_request:
+    branches: 
+      - "refactor/typescript"
+
+jobs:
+  # ------------------------------------------------------------------
+  # JOB 1: Quality & Security Checks
+  # ------------------------------------------------------------------
+  quality-check:
+    name: Quality & Security (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-service, url-builder-service, email-service]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./${{ matrix.service }}/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ./${{ matrix.service }}
+        run: npm install
+
+      # 1. Security Audit (Check for vulnerabilities)
+      - name: 🛡️ Security Audit
+        working-directory: ./${{ matrix.service }}
+        run: npm audit --audit-level=high || true
+
+      # 2. Linting (Check code style & errors)
+      - name: 🎨 Lint Code
+        working-directory: ./${{ matrix.service }}
+        run: npm run lint --if-present
+
+  # ------------------------------------------------------------------
+  # JOB 2: Unit Tests & Compilation
+  # ------------------------------------------------------------------
+  unit-tests:
+    name: Unit Tests (${{ matrix.service }})
+    needs: quality-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-service, url-builder-service, email-service]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./${{ matrix.service }}/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ./${{ matrix.service }}
+        run: npm install
+
+      # 3. Run Tests (Jest handles TS automatically via ts-jest)
+      - name: 🧪 Run Jest Tests
+        working-directory: ./${{ matrix.service }}
+        run: npm test
+        env:
+          # Mocks handle logic, but this prevents config crashes
+          JWT_SECRET: test_secret
+          MONGO_URI: mongodb://localhost:27017/test_db
+          RABBITMQ_URL: amqp://localhost
+
+      # 4. Verify TypeScript Compilation (Critical step for TS projects)
+      - name: 🏗️ Verify Compilation (tsc)
+        working-directory: ./${{ matrix.service }}
+        run: npm run build
+
+  # ------------------------------------------------------------------
+  # JOB 3: Live Integration Test (Docker Compose)
+  # ------------------------------------------------------------------
+  integration-test:
+    name: Integration Test (System)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    env:
+      GATEWAY_PORT: 3000
+      AUTH_PORT: 3001
+      URL_BUILDER_PORT: 3002
+      EMAIL_PORT: 3003
+      MONGO_URI: mongodb://mongo:27017/nexaminds_db
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      # Use the secret from GitHub, or a dummy one for testing
+      JWT_SECRET: ${{ secrets.JWT_SECRET || 'default_ci_secret' }}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      EMAIL_SERVICE_URL: http://email-service:3003
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 5. Spin up the Full Stack
+      # Because we use Multi-stage Dockerfiles, this compiles TS to JS inside the containers
+      - name: 🐳 Start Services
+        run: docker compose up -d --build
+
+      # 6. Wait for Healthchecks (Mongo & RabbitMQ)
+      - name: ⏳ Wait for Services
+        run: |
+          echo "Waiting for infrastructure..."
+          sleep 20
+          docker compose ps
+
+      # 7. Run Real API Requests against the Gateway
+      - name: 🧪 Run Integration Scenarios
+        run: |
+          echo "--- 1. Testing User Registration (Auth Service) ---"
+          # Note: We use the Gateway Port 3000
+          curl --fail -v -X POST http://localhost:3000/api/v1/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"fullname": "CI User", "email": "ci@test.com", "password": "123"}'
+          
+          echo "--- 2. Testing URL Builder Flow (Auth -> URL -> Email) ---"
+          curl --fail -v -X POST http://localhost:3000/api/v1/tools/buildUrl \
+            -H "Content-Type: application/json" \
+            -d '{"name": "CI User", "timestamps": [10, 20, 30]}'
+
+      # 8. Debugging logs if anything fails
+      - name: 📜 Dump Logs on Failure
+        if: failure()
+        run: docker compose logs
